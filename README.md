@@ -4,7 +4,5 @@ Citation
 
 If you use this workflow in your research, please cite the following paper:
 @article{
-  title={Mapping Facade Materials Utilizing Zero-Shot Segmentation for Applications in Urban Microclimate Research},
-  author={Klimenko, Nikita, Tarkhan, Nada },
-  year={2024}
+Tarkhan, N., Klimenka, M., Fang, K. et al. Mapping facade materials utilizing zero-shot segmentation for applications in urban microclimate research. Sci Rep 15, 5492 (2025). https://doi.org/10.1038/s41598-025-86307-1
 }
