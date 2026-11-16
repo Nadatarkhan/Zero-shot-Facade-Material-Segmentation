@@ -88,9 +88,12 @@ Measured on a single NVIDIA RTX 2080 Ti:
 
 In total this is about 17.6 s per image with OpenAI CLIP and 37.6 s with CLIPSeg, plus Grounding DINO.
 
+These are the paper's timings. In those runs, CLIP and CLIPSeg ran on the CPU. The current script runs them on the GPU and encodes the text prompts only once. It also skips the overlap check for SAM segments whose boxes don't touch. All of this gives the same predictions, so classification and SAM post-processing should be noticeably faster than these figures.
+
 ### Evaluation metrics
 
-- **Weighted IoU:** per-class IoU, weighted by each class's pixel ratio. A material presence threshold (1% of pixels) keeps tiny false positives from distorting the score. Precision and recall are reported too.
+- **IoU, precision and recall per class**, averaged over images. A class is left out for an image when it covers less than 5% of the pixels in both the prediction and the ground truth, so tiny false positives don't distort the score.
+- **Total:** the paper reports this as "weighted" IoU (Eq. 1). The original evaluation code computes it as the plain mean of the per-class values. `evaluate.py` reports both that mean (which reproduces the paper's tables) and a pixel-weighted total.
 - **Predominant material:** whether the material covering the largest facade area is predicted correctly.
 - **Material presence:** the share of the top three ground-truth materials that are detected.
 
@@ -173,8 +176,10 @@ The UTCI was simulated in a north/south-facing street canyon, 5 m wide with buil
 ```
 run_zero_shot_inference.py      Full zero-shot pipeline (ADE20K + SAM + CLIPSeg/CLIP + Grounding DINO)
 groundingdino_utils_windows.py  Grounding DINO + SAM window/door detection (GROUNDING_DINO_OUTPUT)
+evaluate.py                     Metrics: IoU, precision, recall, predominant material, top-3 presence
 raw_clipseg_inference.ipynb     Baseline: CLIPSeg applied directly to the whole image ("CLIPSeg only")
-validation_workflow.ipynb       Metrics: weighted IoU, precision, recall, predominant material, presence
+validation_workflow.ipynb       Original evaluation notebook (evaluate.py is the runnable version)
+tools/convert_masks_to_png.py   Converts the original JPEG masks to clean PNG
 TRAIN_SEGFORMER/                Supervised SegFormer baseline
   MANAGE_DATA.ipynb             Remaps class IDs and builds the 5 cross-validation folds
   folds.csv                     Fold assignment of each labelled image
@@ -271,7 +276,34 @@ Outputs, one file per input image, in sub-folders of `--output-dir`:
 | `PRED/*.jpg` | Facade (ADE20K) mask |
 | `RGB/*.jpg` | Copy of the input |
 
-To change the materials, edit the prompt table `label_df` in `run_zero_shot_inference.py`. Each row maps a text prompt to a class name, colour and class ID. To compute metrics against ground truth, set the paths in `validation_workflow.ipynb`.
+To change the materials, edit the prompt table `label_df` in `run_zero_shot_inference.py`. Each row maps a text prompt to a class name, colour and class ID.
+
+Grounding DINO runs on the CPU by default, as in the paper. If your Grounding DINO install compiled its CUDA extension, `GDINO_DEVICE=cuda` saves about 20 s per image.
+
+When the run finishes, the script lists any images it skipped, and any where window/door detection failed. A Grounding DINO failure doesn't stop the run, but windows and doors will be missing from that image's output.
+
+### Evaluation
+
+Compare predictions with the ground-truth masks:
+
+```bash
+python evaluate.py --pred-dir path/to/OUTPUTS/CLIPSEG --gt-dirs DATASETS/*/MASKS --by-city --csv results.csv
+```
+
+This prints:
+
+- per-class IoU, precision and recall, overall and per city;
+- the two totals described under [Evaluation metrics](#evaluation-metrics);
+- predominant-material accuracy and top-3 material presence.
+
+Predictions are matched to masks by file name. `--presence-threshold` (default 0.05) and `--detect-threshold` (default 0.01) control when a class counts as present.
+
+Two things in `evaluate.py` differ slightly from the original notebook, so scores may not match the paper exactly:
+
+- it scores against the cleaned PNG masks (see [Dataset](#dataset));
+- it resizes predictions with nearest-neighbour instead of bilinear interpolation, so class IDs stay intact.
+
+The original notebook didn't include code for the predominant-material and top-3 metrics; `evaluate.py` implements them from the paper's definitions.
 
 ## Dataset
 
@@ -294,7 +326,11 @@ Each mask is a single-channel image whose pixel values are class IDs. Most are 9
 | 17 | Metal |
 | 32 | Door |
 
-The masks are stored as JPEG, so compression can leave a few stray values near class boundaries. Map any value outside the class list to its nearest class, or ignore it.
+The masks are lossless PNGs. They were originally saved as JPEG, which blurred class IDs along class edges. `tools/convert_masks_to_png.py` reassigned every pixel with an invalid value to the label of the nearest valid pixel. This changed 0.83% of pixels, all on class boundaries. The original JPEGs are in the git history.
+
+JPEG blurring can also produce a *valid* ID along an edge, for example concrete (11) between glazing (10) and brick (12). Those pixels couldn't be told apart from real labels, so they were left unchanged.
+
+The RGB street-view images are not included yet.
 
 ## Citation
 

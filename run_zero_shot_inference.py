@@ -6,6 +6,7 @@ import numpy as np
 
 
 import argparse
+import traceback
 
 # Create the parser
 parser = argparse.ArgumentParser(description='Zero-shot facade material segmentation (SAM + CLIP/CLIPSeg + Grounding DINO).')
@@ -174,33 +175,55 @@ def add_strong_blur_to_mask(mask, max_blur_size=40, blur_strength=25):
 
 
 model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
+model = model.to(device).eval()
 tokenizer = open_clip.get_tokenizer('ViT-B-32')
 
 processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
 model_clipseg = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
+model_clipseg = model_clipseg.to(device).eval()
+
+# The text prompts are the same for every patch, so their embeddings are
+# computed once and cached instead of being re-encoded for each patch.
+_clipseg_text_cache = {}
+_clip_text_cache = {}
+
+
+def _clipseg_conditional_embeddings(prompts):
+    key = tuple(prompts)
+    if key not in _clipseg_text_cache:
+        text_inputs = processor.tokenizer(prompts, padding="max_length", return_tensors="pt").to(device)
+        with torch.no_grad():
+            _clipseg_text_cache[key] = model_clipseg.get_conditional_embeddings(
+                batch_size=len(prompts), input_ids=text_inputs.input_ids, attention_mask=text_inputs.attention_mask)
+    return _clipseg_text_cache[key]
+
+
+def _clip_text_features(labels):
+    key = tuple(labels)
+    if key not in _clip_text_cache:
+        with torch.no_grad():
+            text_features = model.encode_text(tokenizer(labels).to(device))
+            _clip_text_cache[key] = text_features / text_features.norm(dim=-1, keepdim=True)
+    return _clip_text_cache[key]
+
 
 def CLIPSEG_PREDICT(image, mask,label_df):
     image = Image.fromarray(image)
-    
+
     prompts = list(label_df['classname_full'])
     labels_short = list(label_df['classname_short'])
     labels_long = list(label_df['classname_full'])
-    
-    preds_list = []
-    scores_list =[]
-    inputs = processor(text=prompts, images=[image] * len(prompts), padding="max_length", return_tensors="pt")
-    with torch.no_grad():
-      outputs = model_clipseg(**inputs)
-    preds = outputs.logits.unsqueeze(1)
-    for tensor in preds:
-#         shifted_tensor = tensor - tensor.min()
-#         sum_shifted_tensor = shifted_tensor.sum()
-#         normalized_tensor = (shifted_tensor / sum_shifted_tensor)
 
-        normalized_tensor=tensor
-        preds_list.append(normalized_tensor[0])
-        resized_mask = torch.tensor(zoom(mask, (352 / mask.shape[0], 352 / mask.shape[1]), order=1))
-        scores_list.append(torch.sum((normalized_tensor[0])*resized_mask).item())
+    # One copy of the patch per prompt, scored against the cached prompt embeddings.
+    pixel_values = processor(images=image, return_tensors="pt").pixel_values.to(device)
+    pixel_values = pixel_values.repeat(len(prompts), 1, 1, 1)
+    with torch.no_grad():
+      outputs = model_clipseg(pixel_values=pixel_values, conditional_embeddings=_clipseg_conditional_embeddings(prompts))
+    preds = outputs.logits.reshape(len(prompts), 352, 352)
+    # Raw CLIPSeg logits are summed inside the patch mask (no normalization, as
+    # in the original experiments) and the prompt with the highest sum wins.
+    resized_mask = torch.as_tensor(zoom(mask, (352 / mask.shape[0], 352 / mask.shape[1]), order=1)).to(device, dtype=preds.dtype)
+    scores_list = (preds * resized_mask).sum(dim=(1, 2)).tolist()
 
     #print(scores_list)
     index = scores_list.index(max(scores_list))
@@ -212,20 +235,19 @@ def CLIPSEG_PREDICT(image, mask,label_df):
 def clip_classify(image, label_df):
     pil_image = Image.fromarray(image)
     labels_long = list(label_df['classname_full'])
-    image = preprocess(pil_image).unsqueeze(0)
+    image = preprocess(pil_image).unsqueeze(0).to(device)
 
     labels = list(label_df['classname_full'])
     labels_short = list(label_df['classname_short'])
-    text = tokenizer(labels)
-    
-    with torch.no_grad(), torch.cuda.amp.autocast():
+
+    # Full precision (fp32), matching the original CPU runs.
+    with torch.no_grad():
         image_features = model.encode_image(image)
-        text_features = model.encode_text(text)
         image_features /= image_features.norm(dim=-1, keepdim=True)
-        text_features /= text_features.norm(dim=-1, keepdim=True)
-    
+        text_features = _clip_text_features(labels)
+
         text_probs = (100.0 * image_features @ text_features.T).softmax(dim=-1)
-    
+
 
     index = torch.argmax(text_probs).item()
     answer = labels_short[index]
@@ -293,6 +315,13 @@ def produce_list_of_elements(masks,pred,pure_image, label_df, zoom_factor):
 
 
 
+def _bboxes_overlap(a, b):
+    """True if two SAM boxes (x, y, w, h) overlap, with a 1-pixel margin."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax <= bx + bw + 1 and bx <= ax + aw + 1 and ay <= by + bh + 1 and by <= ay + ah + 1
+
+
 def process_image(PATH, label_df, zoom_factor, downscale_factor):
 
     start_time = time.time()
@@ -308,7 +337,6 @@ def process_image(PATH, label_df, zoom_factor, downscale_factor):
     #pure_image = zoom(pure_image, (1,1,1), order=0)
     pure_image_for_masking = cv2.resize(pure_image, (pred.shape[1], pred.shape[0]))
     print(pure_image_for_masking.shape)
-    cv2.imwrite('pure_image_for_masking.jpg', pure_image_for_masking)
     pure_image = cv2.cvtColor(pure_image, cv2.COLOR_RGB2BGR)
     masks = mask_generator_2.generate(pure_image_for_masking)
     size_threshold = pure_image.shape[0]*pure_image.shape[1]/100/(zoom_factor*zoom_factor)#200 75
@@ -331,10 +359,16 @@ def process_image(PATH, label_df, zoom_factor, downscale_factor):
     
 
     for mask1 in masks_pre:
-           
+
             print("|", end="")
             overlap = False
             for mask2 in masks:
+                # Skip pairs whose SAM bounding boxes do not overlap: subtracting a
+                # non-overlapping mask changes nothing, and this avoids full-image
+                # boolean operations for most pairs. (Masks only shrink in this
+                # loop, so the original SAM boxes remain valid bounds.)
+                if not _bboxes_overlap(mask1['bbox'], mask2['bbox']):
+                    continue
                 if mask1['area'] > mask2['area']:
                     #overlap_mask = mask1['segmentation']*1-mask2['segmentation']*1
                     overlap_mask = np.logical_and(mask1['segmentation'], np.logical_not(mask2['segmentation']))
@@ -408,6 +442,8 @@ for sub in ['RGB', 'COMBINED', 'CLIPSEG', 'SAM', 'PRED']:
 
 
 ooo=0
+gdino_failures = []
+failures = []
 for FILENAME in os.listdir(DIR):
     ooo = ooo+1
     print(ooo)
@@ -429,9 +465,13 @@ for FILENAME in os.listdir(DIR):
                 image = image.resize((image.width // 1, image.height // 1))
                 try:
                     image_array = GROUNDING_DINO_OUTPUT(image)
-                    image_array = cv2.resize(image_array, (pred.shape[1],pred.shape[0]))
-                except:
-                    print('GDINO DID NOT WORK')
+                    image_array = cv2.resize(image_array, (pred.shape[1],pred.shape[0]), interpolation=cv2.INTER_NEAREST)
+                except Exception:
+                    # Do not fail the whole image, but make the failure visible:
+                    # without this branch, windows and doors are missing from the output.
+                    traceback.print_exc()
+                    print(f'WARNING: Grounding DINO failed for {FILENAME}; windows/doors will be missing from this output.')
+                    gdino_failures.append(FILENAME)
                     image_array = np.zeros_like(pred)
                 end_time = time.time()
                 elapsed_time = end_time - start_time
@@ -472,3 +512,10 @@ for FILENAME in os.listdir(DIR):
 
             except Exception as e:
                 print('Error:', e)
+                failures.append((FILENAME, str(e)))
+
+print(f'\nDone. {len(failures)} image(s) skipped with errors, {len(gdino_failures)} without window/door detection.')
+for name, err in failures:
+    print(f'  skipped {name}: {err}')
+for name in gdino_failures:
+    print(f'  no Grounding DINO output: {name}')
