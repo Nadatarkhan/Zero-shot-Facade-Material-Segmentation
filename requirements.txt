@@ -1,0 +1,27 @@
+# Python >= 3.9 (the original experiments used Python 3.10).
+# Install PyTorch first, matching your CUDA version: https://pytorch.org/get-started/locally/
+torch>=2.0
+torchvision>=0.15
+
+# Zero-shot inference pipeline (run_zero_shot_inference.py)
+numpy
+scipy
+pandas
+pillow
+opencv-python
+matplotlib
+tqdm
+open_clip_torch          # OpenAI CLIP ViT-B-32 (laion2b_s34b_b79k weights)
+transformers>=4.30       # CLIPSeg (CIDAS/clipseg-rd64-refined) and SegFormer
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+mit_semseg @ git+https://github.com/CSAILVision/semantic-segmentation-pytorch.git
+# Grounding DINO is installed separately (it compiles a CUDA extension and must
+# see your installed torch):
+#   pip install --no-build-isolation git+https://github.com/IDEA-Research/GroundingDINO.git
+
+# SegFormer baseline and validation notebooks (TRAIN_SEGFORMER/, validation_workflow.ipynb)
+datasets<3.0             # the notebooks use datasets.load_metric, removed in datasets 3.0
+evaluate
+huggingface_hub<0.26     # the notebooks import cached_download, removed in 0.26
+scikit-learn
+jupyter

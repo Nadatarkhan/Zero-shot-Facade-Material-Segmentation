@@ -1,7 +1,5 @@
 import os, shutil, cv2,datetime, torch, torchvision.transforms, json, torchvision, copy, time, open_clip, sys,PIL.Image
 import matplotlib.pyplot as plt
-os.chdir('/home/klimenko/seg_materials/')
-print(os.getcwd())
 import pandas as pd
 import numpy as np
 
@@ -10,19 +8,25 @@ import numpy as np
 import argparse
 
 # Create the parser
-parser = argparse.ArgumentParser(description='Your script description here.')
-parser.add_argument('--cuda', type=int, help='CUDA device number')
+parser = argparse.ArgumentParser(description='Zero-shot facade material segmentation (SAM + CLIP/CLIPSeg + Grounding DINO).')
+parser.add_argument('--input-dir', required=True, help='Folder of RGB facade images')
+parser.add_argument('--output-dir', required=True, help='Folder for outputs (RGB/, COMBINED/, CLIPSEG/, SAM/, PRED/ are created inside)')
+parser.add_argument('--cuda', type=int, default=0, help='CUDA device number (falls back to CPU if CUDA is unavailable)')
+parser.add_argument('--classifier', choices=['clipseg', 'clip'], default='clipseg',
+                    help="Patch classifier: 'clipseg' (Method 1 in the paper, default) or 'clip' (OpenAI CLIP, Method 2)")
+parser.add_argument('--sam-checkpoint', default='ckpt/sam_vit_h_4b8939.pth', help='SAM ViT-H checkpoint')
+parser.add_argument('--ade-ckpt-dir', default='ckpt/ade20k-resnet50dilated-ppm_deepsup',
+                    help='Folder with encoder_epoch_20.pth and decoder_epoch_20.pth (MIT semseg, ADE20K)')
 args = parser.parse_args()
-if args.cuda is not None:
-    print(f'CUDA device selected: {args.cuda}')
-else:
-    print('No CUDA device selected.')
-    
-    
-    
-device = "cuda:"+str(args.cuda)
+
+device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
+print('Device:', device)
+
+# groundingdino_utils_windows reads its SAM checkpoint from this variable.
+os.environ.setdefault('SAM_CHECKPOINT', args.sam_checkpoint)
+os.environ.setdefault('SAM_DEVICE', str(device))
 #from seg_utils import process_image, show_anns_reg,convert_to_classes
-from groundingdino_utils_windows import GROUNDING_DINO_OUTPUT
+from groundingdino_utils_windows import GROUNDING_DINO_OUTPUT, set_sam_model
 import matplotlib.colors as mcolors
 from PIL import Image
 import time
@@ -54,10 +58,11 @@ from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamP
 # DEFINE SAM AND SETTINGS
 #########################
 
-sam_checkpoint = "sam_vit_h_4b8939.pth"
+sam_checkpoint = args.sam_checkpoint
 model_type = "vit_h"
 sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
 sam.to(device=device)
+set_sam_model(sam)  # share this SAM model with the Grounding DINO + SAM window/door branch
 
 
 mask_generator_2 = SamAutomaticMaskGenerator(
@@ -104,12 +109,11 @@ def hex_to_rgb(hex_color):
 # ADE20K Segmentation to Extract Facade
 ###################################
 
-net_encoder = ModelBuilder.build_encoder(arch='resnet50dilated',fc_dim=2048,weights='ckpt/ade20k-resnet50dilated-ppm_deepsup/encoder_epoch_20.pth')
-net_decoder = ModelBuilder.build_decoder(arch='ppm_deepsup',fc_dim=2048,num_class=150,weights='ckpt/ade20k-resnet50dilated-ppm_deepsup/decoder_epoch_20.pth',use_softmax=True)
+net_encoder = ModelBuilder.build_encoder(arch='resnet50dilated',fc_dim=2048,weights=os.path.join(args.ade_ckpt_dir, 'encoder_epoch_20.pth'))
+net_decoder = ModelBuilder.build_decoder(arch='ppm_deepsup',fc_dim=2048,num_class=150,weights=os.path.join(args.ade_ckpt_dir, 'decoder_epoch_20.pth'),use_softmax=True)
 crit = torch.nn.NLLLoss(ignore_index=-1)
 segmentation_module = SegmentationModule(net_encoder, net_decoder, crit)
 segmentation_module.eval()
-device = torch.device("cuda:1")
 segmentation_module.to(device)
 pil_to_tensor = torchvision.transforms.Compose([torchvision.transforms.ToTensor(),torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  ])
 
@@ -267,9 +271,12 @@ def produce_list_of_elements(masks,pred,pure_image, label_df, zoom_factor):
 #         out_list_fragments.append(instance_clip)
 #         out_list_masks.append(instance_mask)
         print(instance.shape, end=" ")
-        #a, i = clip_classify(instance_clip, label_df)
-        #acs, aci = CLIPSEG_PREDICT(instance, instance_mask,label_df)
-        acs, aci = clip_classify(instance_clip, label_df)
+        if args.classifier == 'clipseg':
+            # Method 1 in the paper: sum of CLIPSeg attention inside the patch mask
+            acs, aci = CLIPSEG_PREDICT(instance, instance_mask, label_df)
+        else:
+            # Method 2 in the paper: OpenAI CLIP classification of the masked patch
+            acs, aci = clip_classify(instance_clip, label_df)
         a,i =acs, aci
         color = label_df.loc[label_df['classname_short'] == a, 'color'].values[0]
         color_ac = label_df.loc[label_df['classname_short'] == acs, 'color'].values[0]
@@ -391,12 +398,11 @@ label_df_DINO = pd.DataFrame(data_DINO[1:], columns=data_DINO[0])
 
 
 
-# DIR = '/home/klimenko/seg_materials/MAPS/images/ams/AMS_RGB/'
-# DIR_ACTUAL = '/home/klimenko/seg_materials/MAPS/images/ams/AMS_RGB/'
-# OUT_DIR = '/home/klimenko/seg_materials/MAPS/images/ams/OUTPUTS/'
-DIR = '/home/klimenko/seg_materials/FINAL_DATASETS/AMSTERDAM/RGB/'
+DIR = os.path.join(args.input_dir, '')
 DIR_ACTUAL = DIR
-OUT_DIR = '/home/klimenko/seg_materials/FINAL_DATASETS/AMSTERDAM/NEW_OUTPUTS5/'
+OUT_DIR = os.path.join(args.output_dir, '')
+for sub in ['RGB', 'COMBINED', 'CLIPSEG', 'SAM', 'PRED']:
+    os.makedirs(OUT_DIR + sub, exist_ok=True)
 
 
 
